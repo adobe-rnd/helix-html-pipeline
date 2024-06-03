@@ -16,6 +16,14 @@ import setCustomResponseHeaders from './steps/set-custom-response-headers.js';
 import { authenticate } from './steps/authenticate.js';
 import fetchConfig from './steps/fetch-config.js';
 import validateCaptcha from './steps/validate-captcha.js';
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+
+const SOURCE_LOCATION_CACHE_TABLE = 'FORMS_SOURCE_LOCATION_CACHE';
+const SOURCE_LOCATION_CACHE_TTL = 3600;
+
+const dynamoClient = new DynamoDBClient({});
+const dynamoDocClient = DynamoDBDocumentClient.from(dynamoClient);
 
 function error(log, msg, status, response) {
   log.error(msg);
@@ -81,6 +89,45 @@ export async function extractBodyData(request) {
   return body;
 }
 
+async function getSourceLocationNoCache(coords) {
+  const resp = await fetch(`https://admin.hlx.page/preview/${coords}`);
+  const body = resp.status === 200? await resp.json(): { preview: {} };
+  const sheetNames = body.preview.sheetNames? body.preview.sheetNames.split(',').map((s) => s.trim()): [];
+  return {
+    form_coordinates: coords,
+    source_location: body.preview.sourceLocation || '',
+    has_incoming: sheetNames.includes('incoming'),
+  }
+}
+
+async function getSourceLocation(owner, repo, ref, resourcePath) {
+  const coords = `${owner}/${repo}/${ref}${resourcePath}`;
+  console.log("getSourceLocation: ", coords);
+  var query = new GetCommand({
+    TableName: SOURCE_LOCATION_CACHE_TABLE,
+    Key: {
+      form_coordinates: coords,
+    },
+  });
+  const getResp = await dynamoDocClient.send(query);
+  if (getResp.Item) {
+    console.log("SL CACHE HIT: ", coords);
+    return getResp.Item;
+  } else {
+    console.log("SL CACHE MISS: ", coords);
+    const item = await getSourceLocationNoCache(coords);
+    const putCommand = new PutCommand({
+      TableName: SOURCE_LOCATION_CACHE_TABLE,
+      Item: {
+        ...item,
+        expiration_timestamp: Math.round(new Date() / 1000) + SOURCE_LOCATION_CACHE_TTL,
+      },
+    });
+    await dynamoDocClient.send(putCommand);
+    return item;
+  }
+}
+
 /**
  * Handle a pipeline POST request.
  * At this point POST's only apply to json files that are backed by a workbook.
@@ -98,7 +145,7 @@ export async function formsPipe(state, req) {
       'content-type': 'text/plain; charset=utf-8',
     },
   });
-  try {
+  /* try {
     await fetchConfig(state, req, res);
   } catch (e) {
     // ignore
@@ -114,7 +161,7 @@ export async function formsPipe(state, req) {
   if (res.error) {
     return res;
   }
-  await setCustomResponseHeaders(state, req, res);
+  await setCustomResponseHeaders(state, req, res); */
 
   const {
     owner, repo, ref, contentBusId, partition, s3Loader,
@@ -142,7 +189,7 @@ export async function formsPipe(state, req) {
   }
 
   // head workbook in content bus
-  const resourceFetchResponse = await s3Loader.headObject('helix-content-bus', `${contentBusId}/${partition}${resourcePath}`);
+  /* const resourceFetchResponse = await s3Loader.headObject('helix-content-bus', `${contentBusId}/${partition}${resourcePath}`);
   if (resourceFetchResponse.status !== 200) {
     return resourceFetchResponse;
   }
@@ -150,14 +197,15 @@ export async function formsPipe(state, req) {
   const sheets = resourceFetchResponse.headers.get('x-amz-meta-x-sheet-names');
   if (!sheets) {
     return error(log, `Target workbook at ${resourcePath} missing x-sheet-names header.`, 403, res);
-  }
+  } */
 
-  const sourceLocation = resourceFetchResponse.headers.get('x-amz-meta-x-source-location');
+  const sourceLocationInfo = await getSourceLocation(owner, repo, ref, resourcePath);
+  const sourceLocation = sourceLocationInfo.source_location;
   const referer = req.headers.get('referer') || 'unknown';
-  const sheetNames = sheets.split(',').map((s) => s.trim());
+  // const sheetNames = sheets.split(',').map((s) => s.trim());
 
-  if (!sourceLocation || !sheetNames.includes('incoming')) {
-    return error(log, `Target workbook at ${resourcePath} is not setup to intake data.`, 403, res);
+  if (!sourceLocation || !sourceLocationInfo.has_incoming) {
+    return error(log, `Target workbook at ${resourcePath} does not exist or is not setup to intake data.`, 403, res);
   }
 
   // Send message to SQS if workbook contains and incoming
